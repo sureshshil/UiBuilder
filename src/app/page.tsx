@@ -458,7 +458,6 @@ export default function Home() {
           <>
             <div style={{ flex: 1, width: '100%', height: '100%', display: activeTab === 'preview' ? 'flex' : 'none', flexDirection: 'column' }}>
               <SandpackProvider
-                key={`sp-${generatedCode.length}-${Object.keys(sandpackFiles).length}`}
                 template="react-ts"
                 theme="dark"
                 files={sandpackFiles}

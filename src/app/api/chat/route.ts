@@ -22,8 +22,11 @@ CRITICAL OUTPUT FORMAT:
 <file path="/App.tsx">
 // code here
 </file>
-- ALWAYS include an /App.tsx file as the main entry point.
-- You can create multiple files (e.g., /components/Button.tsx, /lib/utils.ts) and import them normally.
+- ONLY generate React components (e.g., /App.tsx, /components/Header.tsx) and /styles.css.
+- NEVER generate /package.json, /vite.config.ts, /tailwind.config.js, or /index.html. These are already configured internally! Generating them will crash the bundler.
+- Your main entry point must ALWAYS be /App.tsx which exports a default component.
+- The /styles.css file is globally injected.
+- You can create multiple files and import them normally.
 - Do NOT use markdown code blocks (\`\`\`) around the XML tags or the code.
 
 STYLING:
