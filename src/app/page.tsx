@@ -5,6 +5,8 @@ import dynamic from 'next/dynamic';
 import Editor from '@monaco-editor/react';
 import Sidebar from '@/components/Sidebar';
 import { createClient } from '@/lib/supabase/client';
+import SandpackErrorListener from '@/components/SandpackErrorListener';
+import { parseUploadedFile } from '@/lib/uploadedData';
 
 // Dynamically import Sandpack components to avoid SSR issues
 const SandpackProvider = dynamic(
@@ -49,11 +51,7 @@ class ErrorBoundary extends Component<{children: ReactNode}, {hasError: boolean,
   }
 }
 
-interface ChatMessage {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-}
+import { CopilotService, ChatMessage } from '@/services/copilotService';
 
 export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -66,6 +64,12 @@ export default function Home() {
   const [isDeploying, setIsDeploying] = useState(false);
   const [deployedUrl, setDeployedUrl] = useState('');
   const [selectedFile, setSelectedFile] = useState('/App.tsx');
+  const [autoHealAttempts, setAutoHealAttempts] = useState(0);
+  const [lastWorkingCode, setLastWorkingCode] = useState('');
+  
+  const [uploadedFiles, setUploadedFiles] = useState<{name: string, content: string}[]>([]);
+  const [uploadedSchema, setUploadedSchema] = useState<any>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const sandpackFiles = useMemo(() => {
     if (!generatedCode) return {};
@@ -74,6 +78,13 @@ export default function Home() {
       "/styles.css": { code: "body { margin: 0; padding: 0; box-sizing: border-box; font-family: sans-serif; }" }
     };
     
+    // Placed at root (not /public/) so generated code can import it directly,
+    // e.g. `import dataUrl from './sales.tsv'` — Sandpack resolves relative
+    // asset imports to a real data: URL, unlike fetching from /public at runtime.
+    uploadedFiles.forEach(f => {
+      files[`/${f.name}`] = { code: f.content };
+    });
+    
     const fileRegex = /<file path="([^"]+)">([\s\S]*?)<\/file>/g;
     let match;
     let foundFiles = false;
@@ -81,19 +92,37 @@ export default function Home() {
     while ((match = fileRegex.exec(generatedCode)) !== null) {
       foundFiles = true;
       const path = match[1].startsWith('/') ? match[1] : `/${match[1]}`;
-      files[path] = { 
-        code: match[2].trim(),
-        active: path === '/App.tsx'
-      };
+      const codeContent = match[2].trim();
+      if (codeContent) {
+        files[path] = { 
+          code: codeContent,
+          active: path === '/App.tsx'
+        };
+      }
     }
     
-    // Backward compatibility for old single-file projects
+    // Fallback if no files matched (AI returned conversational text)
     if (!foundFiles) {
-      files["/App.tsx"] = { code: generatedCode, active: true };
+      if (lastWorkingCode) {
+        // Recover from last working code
+        const fallbackRegex = /<file path="([^"]+)">([\s\S]*?)<\/file>/g;
+        let fallbackMatch;
+        while ((fallbackMatch = fallbackRegex.exec(lastWorkingCode)) !== null) {
+          const path = fallbackMatch[1].startsWith('/') ? fallbackMatch[1] : `/${fallbackMatch[1]}`;
+          files[path] = { code: fallbackMatch[2].trim(), active: path === '/App.tsx' };
+        }
+      } else {
+        files["/App.tsx"] = { code: "export default function App() { return <div className=\"p-8 text-white\">I can only understand code generation requests! Please ask me to build a UI.</div> }", active: true };
+      }
+    }
+    
+    // Ensure styles.css always exists if missing to prevent PostCSS crashes
+    if (!files["/styles.css"]) {
+      files["/styles.css"] = { code: `body { font-family: sans-serif; padding: 1rem; }` };
     }
     
     return files;
-  }, [generatedCode]);
+  }, [generatedCode, uploadedFiles, lastWorkingCode]);
 
   const deployProject = async () => {
     if (!sandpackFiles || Object.keys(sandpackFiles).length === 0) return;
@@ -126,41 +155,68 @@ export default function Home() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const sendMessage = async () => {
-    const text = input.trim();
+  const isAutoHealingRef = useRef(false);
+
+  const handleAutoHeal = async (errorMsg: string) => {
+    if (isAutoHealingRef.current || isLoading) return;
+    isAutoHealingRef.current = true;
+
+    if (autoHealAttempts >= 3) {
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'assistant', content: `❌ Failed to fix the code after 3 attempts. Reverting to last known working state.` }]);
+      setGeneratedCode(lastWorkingCode);
+      setAutoHealAttempts(0);
+      isAutoHealingRef.current = false;
+      return;
+    }
+
+    setMessages(prev => [...prev, { id: Date.now().toString(), role: 'assistant', content: `⚙️ [System]: Detected a runtime/syntax error: ${errorMsg}. Auto-healing code (Attempt ${autoHealAttempts + 1}/3)...` }]);
+    setAutoHealAttempts(prev => prev + 1);
+    
+    const healPrompt = `The code you generated crashed with this error:\n${errorMsg}\n\nPlease fix this error and return the full updated code. Remember NOT to reference variables inside their own initialization block!`;
+    const healMessages = [...messages, { id: Date.now().toString(), role: 'user', content: healPrompt } as ChatMessage];
+    
+    setIsLoading(true);
+    try {
+      const fullCode = await CopilotService.generateUI(healMessages, generatedCode, uploadedSchema);
+      setGeneratedCode(fullCode);
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'assistant', content: `✅ Auto-healing complete! Let's see if that fixed it.` }]);
+    } catch (err) {
+      console.error("Auto-heal failed", err);
+    } finally {
+      setIsLoading(false);
+      // Add a slight delay before unlocking to allow Sandpack to compile
+      setTimeout(() => { isAutoHealingRef.current = false; }, 2000);
+    }
+  };
+
+  const sendMessage = async (overrideText?: string | React.MouseEvent) => {
+    const text = typeof overrideText === 'string' ? overrideText : input.trim();
     if (!text || isLoading) return;
+
+    setAutoHealAttempts(0);
+    setLastWorkingCode(generatedCode);
 
     const userMsg: ChatMessage = { id: Date.now().toString(), role: 'user', content: text };
     const newMessages = [...messages, userMsg];
     setMessages(newMessages);
-    setInput('');
+    if (typeof overrideText !== 'string') setInput('');
     setIsLoading(true);
 
-    // Build API messages - inject current code as context in last user message
-    const apiMessages = newMessages.map(m => ({ role: m.role, content: m.content }));
-    apiMessages[apiMessages.length - 1].content += `\n\n[Current Code (use as starting point if modifying)]:\n${generatedCode}`;
-
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: apiMessages }),
-      });
-
-      if (!response.ok) throw new Error(`API error: ${response.status}`);
-
-      let fullCode = await response.text();
-
-      // Strip markdown code fences if the model adds them despite instructions
-      if (fullCode.startsWith('```')) {
-        fullCode = fullCode.replace(/^```[a-z]*\n?/, '');
+      let fullCode = '';
+      const bindableContracts = CopilotService.extractBindableContracts(generatedCode);
+      
+      // If user uploaded schema, has bindable contracts, and explicitly asks to bind/connect/use data
+      if (uploadedSchema && bindableContracts.length > 0 && (text.toLowerCase().includes('bind') || text.toLowerCase().includes('connect') || text.toLowerCase().includes('data'))) {
+        setMessages(prev => [...prev, { id: Date.now().toString(), role: 'assistant', content: `Analyzing binding request for available components...` }]);
+        fullCode = await CopilotService.generateDataBinding(text, bindableContracts, uploadedSchema, generatedCode);
+        setMessages(prev => [...prev, { id: Date.now().toString(), role: 'assistant', content: '✅ Data mapped and bound to the component successfully! Check the code tab to see the adapter.' }]);
+      } else {
+        fullCode = await CopilotService.generateUI(newMessages, generatedCode, uploadedSchema);
+        setMessages(prev => [...prev, { id: Date.now().toString(), role: 'assistant', content: '✅ Done! Your component is ready in the preview panel. Ask me to change anything!' }]);
       }
-      if (fullCode.endsWith('```')) {
-        fullCode = fullCode.replace(/\n?```$/, '');
-      }
-      fullCode = fullCode.trim();
+
       setGeneratedCode(fullCode);
-      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'assistant', content: '✅ Done! Your component is ready in the preview panel. Ask me to change anything!' }]);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
       setMessages(prev => [...prev, { id: Date.now().toString(), role: 'assistant', content: `Sorry, something went wrong: ${msg}` }]);
@@ -233,6 +289,41 @@ export default function Home() {
     setGeneratedCode('');
     setActiveTab('preview');
     inputRef.current?.focus();
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    
+    const text = await file.text();
+    setUploadedFiles(prev => [...prev, { name: file.name, content: text }]);
+
+    let schema: any = null;
+    try {
+      schema = parseUploadedFile(file.name, text);
+    } catch (e) {
+      console.error("Parse error", e);
+    }
+
+    setUploadedSchema(schema);
+    
+    if (schema) {
+      setIsLoading(true);
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'user', content: `Uploaded ${file.name}` }]);
+      try {
+        const suggestions = await CopilotService.getSuggestions(schema);
+        setMessages(prev => [...prev, { 
+          id: Date.now().toString(), 
+          role: 'assistant', 
+          content: `I see you uploaded **${file.name}**. I can build a component to visualize this data, or bind it to an existing chart. What would you like to build?`,
+          suggestions
+        }]);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setIsLoading(false);
+      }
+    }
   };
 
   return (
@@ -327,6 +418,21 @@ export default function Home() {
                 fontSize: '13px', lineHeight: '1.5', color: m.role === 'user' ? '#fff' : '#c4c4d8'
               }}>
                 {m.content}
+                {m.suggestions && m.suggestions.length > 0 && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '12px' }}>
+                    {m.suggestions.map((sug, idx) => (
+                      <button 
+                        key={idx}
+                        onClick={() => sendMessage(sug)}
+                        style={{ padding: '8px 12px', background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.2)', borderRadius: '6px', color: '#a5b4fc', fontSize: '13px', cursor: 'pointer', textAlign: 'left', transition: 'background 0.2s' }}
+                        onMouseOver={e => e.currentTarget.style.background = 'rgba(99,102,241,0.2)'}
+                        onMouseOut={e => e.currentTarget.style.background = 'rgba(99,102,241,0.1)'}
+                      >
+                        {sug}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           ))}
@@ -344,6 +450,28 @@ export default function Home() {
 
         <div style={{ padding: '16px', borderTop: '1px solid rgba(255,255,255,0.06)', background: 'rgba(255,255,255,0.01)' }}>
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+            <input
+              type="file"
+              accept=".json,.csv,.tsv"
+              ref={fileInputRef}
+              style={{ display: 'none' }}
+              onChange={handleFileUpload}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isLoading}
+              title="Upload Data (CSV/TSV/JSON)"
+              style={{
+                width: '42px', height: '42px', borderRadius: '12px', flexShrink: 0,
+                background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px',
+                cursor: isLoading ? 'not-allowed' : 'pointer', transition: 'all 0.2s', color: '#8b8bab'
+              }}
+              onMouseOver={e => { if (!isLoading) e.currentTarget.style.background = 'rgba(255,255,255,0.1)' }}
+              onMouseOut={e => e.currentTarget.style.background = 'rgba(255,255,255,0.05)'}
+            >
+              📄
+            </button>
             <input
               ref={inputRef}
               type="text"
@@ -503,9 +631,15 @@ export default function Home() {
                       "clsx": "^2.1.0",
                       "uuid": "^9.0.0",
                       "class-variance-authority": "^0.7.0",
+                      // Data Fetching & Parsing
+                      "swr": "^2.2.4",
+                      "axios": "^1.6.7",
+                      "papaparse": "^5.4.1",
+                      "@types/papaparse": "^5.3.14",
                     }
                   }}
                 >
+                  <SandpackErrorListener onError={handleAutoHeal} generatedCode={generatedCode} />
                   <SandpackLayout style={{ flex: 1, height: '100%', width: '100%', border: 'none', background: 'transparent', borderRadius: 0 }}>
                     <SandpackPreview
                       style={{ flex: 1, height: '100%', width: '100%' }}
